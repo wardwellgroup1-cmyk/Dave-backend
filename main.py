@@ -1,177 +1,176 @@
 """
-Dave Backend — NyCal.ai
-One FastAPI app, three jobs:
-  1. /api/vim/launch  — Vim Canvas OAuth step 1 (redirect to Vim authorize)
-  2. /api/vim/token   — Vim Canvas OAuth step 2 (code -> token exchange; secret stays server-side)
-  3. /api/analyze     — Claude-powered coding intelligence
+Dave Backend — FastAPI application.
 
-Run locally:  uvicorn main:app --reload --port 8788
-Deploy:       any US-hosted platform (Render / Railway / Fly.io / AWS).
-              Vim requires the app server to be US-hosted.
-
-PHI WARNING: encounter notes are PHI. Before sending real patient notes
-through this endpoint, execute a BAA with Anthropic (available for the
-Claude API — contact Anthropic sales) and confirm your hosting platform
-BAA. Until then, test with de-identified notes only.
+Endpoints:
+  GET  /api/health             — liveness probe (frontend uses this to
+                                  decide whether to call /api/analyze)
+  POST /api/analyze            — Claude-powered note analysis (optional)
+  GET  /api/vim/launch         — Vim OAuth authorize entry (Vim calls this)
+  POST /api/vim/callback       — Vim token exchange (SDK POSTs code here)
+  POST /api/vim/launch-log     — operational telemetry beacon
 """
 
-import json
-import logging
 import os
-from urllib.parse import urlencode
+import logging
+from typing import Optional
 
-import httpx
-from anthropic import AsyncAnthropic
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
-from coding_prompt import CODING_SYSTEM_PROMPT
+from vim_auth import router as vim_router
 
-load_dotenv()
-logging.basicConfig(level=logging.INFO)
+# ---- Logging (no PHI ever) --------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 log = logging.getLogger("dave")
 
-# ---------------------------------------------------------------- config
-VIM_CLIENT_ID = os.getenv("VIM_CLIENT_ID", "")
-VIM_CLIENT_SECRET = os.getenv("VIM_CLIENT_SECRET", "")
-# Your app's frontend URL — must match the redirect URI registered in the Vim Console manifest
-VIM_REDIRECT_URI = os.getenv("VIM_REDIRECT_URI", "https://your-app.example.com")
-# Verify these two against the implementation guide in your Vim Console —
-# they follow Vim's documented OAuth flow (api.getvim.com/v1/oauth/*)
-VIM_AUTHORIZE_URL = os.getenv("VIM_AUTHORIZE_URL", "https://api.getvim.com/v1/oauth/authorize")
-VIM_TOKEN_URL = os.getenv("VIM_TOKEN_URL", "https://api.getvim.com/v1/oauth/token")
-
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
-
-ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
-
-app = FastAPI(title="Dave Backend — NyCal.ai", version="1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# ---- App --------------------------------------------------------------------
+app = FastAPI(
+    title="Dave Coding Intelligence Backend",
+    version="6.5",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
-anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+# ---- CORS ------------------------------------------------------------------
+# Explicit origins from env, plus regex allowance for all Vim subdomains
+# (per Vim spec — the SDK calls our token endpoint from *.getvim.com).
+_cors_env = os.getenv("CORS_ORIGINS", "")
+_cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+if not _cors_origins:
+    fo = os.getenv("FRONTEND_ORIGIN", "").strip()
+    if fo:
+        _cors_origins = [fo]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins or [],
+    allow_origin_regex=r"https://.*\.getvim\.com$",  # Vim SDK cross-origin calls
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    max_age=3600,
+)
+
+# ---- Vim OAuth routes -------------------------------------------------------
+app.include_router(vim_router)
 
 
-# ---------------------------------------------------------------- health
+# ---- Health -----------------------------------------------------------------
 @app.get("/api/health")
 async def health():
+    """Non-PHI liveness probe. The frontend uses this to decide whether to
+    call /api/analyze or fall back to the local rules engine."""
     return {
-        "status": "ok",
-        "claude": bool(anthropic_client),
-        "vim_configured": bool(VIM_CLIENT_ID and VIM_CLIENT_SECRET),
+        "status":         "ok",
+        "version":        "6.5",
+        "claude":         bool(os.getenv("ANTHROPIC_API_KEY", "").strip()),
+        "vim_configured": bool(os.getenv("VIM_CLIENT_ID", "").strip()
+                               and os.getenv("VIM_CLIENT_SECRET", "").strip()),
     }
 
 
-# ---------------------------------------------------------------- Vim OAuth
-@app.get("/api/vim/launch")
-async def vim_launch(launch_id: str, vim_organization_id: str | None = None, ehr_url: str | None = None):
-    """
-    Step 1 of Vim's auth flow. VimOS calls this with a launch_id when it
-    injects your iframe. We redirect to Vim's authorize endpoint, which
-    issues an authorization code back to the redirect_uri (your frontend).
-    vim_organization_id / ehr_url are available for multi-tenant routing
-    or EHR allow/deny lists if you need them later.
-    """
-    if not VIM_CLIENT_ID:
-        raise HTTPException(500, "VIM_CLIENT_ID not configured")
-    params = urlencode({
-        "launch_id": launch_id,
-        "client_id": VIM_CLIENT_ID,
-        "redirect_uri": VIM_REDIRECT_URI,
-        "response_type": "code",
-    })
-    log.info("Vim launch: org=%s", vim_organization_id)
-    return RedirectResponse(f"{VIM_AUTHORIZE_URL}?{params}")
-
-
-class TokenRequest(BaseModel):
-    code: str
-
-
-@app.post("/api/vim/token")
-async def vim_token(body: TokenRequest):
-    """
-    Step 2. The VimOS SDK (frontend) sends us the authorization code;
-    we exchange it — WITH the client secret, which never leaves this
-    server — for the access token + id token the SDK needs.
-    """
-    if not (VIM_CLIENT_ID and VIM_CLIENT_SECRET):
-        raise HTTPException(500, "Vim credentials not configured")
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(
-            VIM_TOKEN_URL,
-            json={
-                "grant_type": "authorization_code",
-                "code": body.code,
-                "client_id": VIM_CLIENT_ID,
-                "client_secret": VIM_CLIENT_SECRET,
-                "redirect_uri": VIM_REDIRECT_URI,
-            },
-        )
-    if resp.status_code != 200:
-        log.error("Vim token exchange failed: %s %s", resp.status_code, resp.text[:300])
-        raise HTTPException(resp.status_code, "Vim token exchange failed")
-    return JSONResponse(resp.json())
-
-
-# ---------------------------------------------------------------- Claude analyze
-class AnalyzeRequest(BaseModel):
-    note: str = Field(..., min_length=10, max_length=50_000)
-    # Optional structured context from the Vim EHR subscription —
-    # existing coded diagnoses, patient age band, etc. (avoid direct identifiers)
-    coded_diagnoses: list[str] | None = None
-    payer_type: str | None = None  # e.g. "Medicare Advantage"
-
-
-EMPTY_ANALYSIS = {
-    "extractedValues": [], "icdRecommendations": [], "emRecommendation": None,
-    "cptII": [], "carePrograms": [], "negationsNoted": [],
-    "documentationGaps": [], "complianceNote": "Provider confirmation required for all codes.",
-}
+# ---- Analyze ----------------------------------------------------------------
+class AnalyzeBody(BaseModel):
+    note: str
+    age_band: Optional[str] = None
+    coded_diagnoses: Optional[list] = None
 
 
 @app.post("/api/analyze")
-async def analyze(body: AnalyzeRequest):
-    if not anthropic_client:
-        raise HTTPException(500, "ANTHROPIC_API_KEY not configured")
+async def analyze(body: AnalyzeBody):
+    """AI-powered analysis using Claude. Frontend falls back to local rules
+    if this endpoint returns anything non-200."""
+    if not body.note or not body.note.strip():
+        raise HTTPException(400, "note is required")
+    if len(body.note) > 50_000:
+        raise HTTPException(413, "note too large (max 50,000 chars)")
 
-    user_content = f"Analyze this encounter note:\n\n<note>\n{body.note}\n</note>"
-    if body.coded_diagnoses:
-        user_content += f"\n\nDiagnoses the provider has already coded: {', '.join(body.coded_diagnoses)}"
-    if body.payer_type:
-        user_content += f"\nPayer type: {body.payer_type}"
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(501, "AI backend not configured — using local rules engine")
 
     try:
-        msg = await anthropic_client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=4000,
-            temperature=0,  # deterministic coding recommendations
-            system=CODING_SYSTEM_PROMPT,
+        import anthropic
+    except ImportError:
+        raise HTTPException(501, "anthropic SDK not installed")
+
+    client = anthropic.Anthropic(api_key=api_key)
+    user_content = _build_user_message(body.note, body.age_band, body.coded_diagnoses)
+
+    try:
+        resp = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=4096,
+            system=_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_content}],
         )
-    except Exception as e:  # network/auth/ratelimit
-        log.exception("Claude API call failed")
-        raise HTTPException(502, f"Analysis service unavailable: {type(e).__name__}")
+    except Exception as e:
+        log.warning("Anthropic call failed: %s", type(e).__name__)
+        raise HTTPException(502, "AI analysis failed — frontend should fall back")
 
-    raw = "".join(block.text for block in msg.content if block.type == "text").strip()
-    # Strip accidental markdown fences, then parse
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        raw = raw[raw.find("{"): raw.rfind("}") + 1]
+    text = "".join(b.text for b in resp.content if hasattr(b, "text"))
+    import json
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        log.error("Claude returned non-JSON: %s", raw[:300])
-        return JSONResponse({**EMPTY_ANALYSIS, "documentationGaps": ["Analysis engine returned an unreadable response — try again."]}, status_code=200)
+        cleaned = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        parsed = json.loads(cleaned)
+    except Exception:
+        raise HTTPException(502, "AI returned unparseable output")
 
-    # Fill any missing keys so the frontend never breaks
-    return JSONResponse({**EMPTY_ANALYSIS, **data})
+    if not isinstance(parsed, dict) or "icd" not in parsed:
+        raise HTTPException(502, "AI output missing required fields")
+
+    return JSONResponse(parsed)
+
+
+# ---- Claude prompt scaffolding ----------------------------------------------
+_SYSTEM_PROMPT = """You are Dave, a coding intelligence agent for primary care.
+
+You analyze a progress note and return STRICT JSON matching this shape:
+
+{
+  "icd": [
+    {"code": "E11.22", "desc": "...", "kind": "upgrade|captured|flag",
+     "hcc": "HCC 37", "raf": 0.302, "note": "..."}
+  ],
+  "em": {"level": "99214", "basis": "...", "value": 132, "baseline": "99213",
+         "baseValue": 93, "tcm": false, "timeNote": null},
+  "programs": [{"code": "G2211", "desc": "...", "note": "..."}],
+  "q": [{"code": "1111F", "desc": "...", "note": "..."}],
+  "v": {"A1c": "8.4%", "eGFR": "52", "BP": "146/88", "BMI": "34.2"},
+  "rafGain": 0.302,
+  "emGain": 39,
+  "payerFindings": []
+}
+
+Rules:
+- Every finding must cite what's actually documented in the note.
+- Never invent findings the chart doesn't support.
+- E/M leveling: use 2021 AMA MDM + time-based override.
+- TCM 99495/99496 are PRIMARY post-discharge codes — never route to 99215
+  when ToC requirements are met.
+- If nothing to report in a category, return an empty array.
+- Return JSON only, no prose, no markdown fences.
+"""
+
+
+def _build_user_message(note: str, age_band: Optional[str], coded: Optional[list]) -> str:
+    parts = ["Analyze this progress note:\n\n", note]
+    if age_band:
+        parts.append(f"\n\nPatient age band: {age_band}")
+    if coded:
+        parts.append(f"\n\nAlready coded on encounter: {', '.join(str(c) for c in coded)}")
+    parts.append("\n\nReturn the JSON now.")
+    return "".join(parts)
+
+
+# ---- Entrypoint -------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
