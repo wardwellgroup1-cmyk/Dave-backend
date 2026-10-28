@@ -24,6 +24,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from vim_auth import router as vim_router
+from api_note import router as note_router      # Dave Super Listen 2: POST /api/note
+from api_listen import router as listen_router  # Dave Super Listen 2: POST /api/listen-token
 
 # ---- Logging (never log note text / PHI) ------------------------------------
 logging.basicConfig(
@@ -72,6 +74,8 @@ app.add_middleware(
 )
 
 app.include_router(vim_router)
+app.include_router(note_router)
+app.include_router(listen_router)
 
 # Simple in-process rate limit (per instance): max N analyzes / window
 _RATE_WINDOW_SEC = 60
