@@ -144,7 +144,7 @@ async def api_note(body: NoteIn):
     try:
         client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", "").strip())
         msg = client.messages.create(
-            model=MODEL, max_tokens=MAX_TOKENS, temperature=0.2, system=SYSTEM,
+            model=MODEL, max_tokens=MAX_TOKENS, system=SYSTEM,
             messages=[{"role": "user", "content": user}],
         )
         text = "".join(getattr(p, "text", "") for p in msg.content)

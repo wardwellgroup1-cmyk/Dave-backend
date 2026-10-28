@@ -1,7 +1,7 @@
 # Dave Backend — NyCal.ai
 
-One FastAPI app: Vim Canvas OAuth (launch + token) and the Claude-powered
-coding intelligence endpoint.
+One FastAPI app: the Claude-powered coding intelligence endpoint (/api/analyze),
+the Dave Super Listen 2 note writer (/api/note) and phone-mic token (/api/listen-token).
 
 ## Quick start
 
@@ -35,19 +35,9 @@ const BACKEND_URL = "https://your-backend.example.com";
 The frontend calls `/api/analyze` and falls back to its built-in local
 engine automatically if the backend is unreachable.
 
-## Vim Console manifest settings
-
-- **Launch endpoint:** `https://your-backend.example.com/api/vim/launch`
-- **Token endpoint:** `https://your-backend.example.com/api/vim/token`
-- **Allowed iframe URLs:** your frontend URL (same as VIM_REDIRECT_URI)
-
-Verify the two Vim OAuth URLs (`VIM_AUTHORIZE_URL`, `VIM_TOKEN_URL`)
-against the implementation guide inside your Vim Console — set them via
-env if they differ.
-
 ## Deploy
 
-Any US-hosted platform (Vim requires US hosting): Render, Railway,
+Any US-hosted platform: Render, Railway,
 Fly.io, AWS. Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
 
 ## PHI / compliance

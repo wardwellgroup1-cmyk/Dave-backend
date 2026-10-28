@@ -4,9 +4,8 @@ Dave Backend — FastAPI application (v7.1)
 Endpoints:
   GET  /api/health             — liveness + chart_in / local_rules flags
   POST /api/analyze            — note and/or chart (local deterministic always; Claude optional)
-  GET  /api/vim/launch         — Vim OAuth authorize entry
-  POST /api/vim/callback       — Vim token exchange
-  POST /api/vim/launch-log     — non-PHI operational beacon
+  POST /api/note               — Dave Super Listen 2 note writer (api_note.py)
+  POST /api/listen-token       — Dave Super Listen 2 phone-mic token (api_listen.py)
 """
 
 from __future__ import annotations
@@ -23,7 +22,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from vim_auth import router as vim_router
 from api_note import router as note_router      # Dave Super Listen 2: POST /api/note
 from api_listen import router as listen_router  # Dave Super Listen 2: POST /api/listen-token
 
@@ -46,7 +44,7 @@ app = FastAPI(
 )
 
 # ---- CORS -------------------------------------------------------------------
-# FRONTEND_ORIGIN + CORS_ORIGINS; always allow Vim SDK origins.
+# FRONTEND_ORIGIN + CORS_ORIGINS.
 _cors_env = os.getenv("CORS_ORIGINS", "")
 _cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
 _fo = os.getenv("FRONTEND_ORIGIN", "").strip()
@@ -66,14 +64,12 @@ for _default in (
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    allow_origin_regex=r"https://.*\.getvim\.com$",
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
     max_age=3600,
 )
 
-app.include_router(vim_router)
 app.include_router(note_router)
 app.include_router(listen_router)
 
@@ -104,10 +100,6 @@ async def health():
         "local_rules": True,
         "chart_in": True,
         "hybrid": True,
-        "vim_configured": bool(
-            os.getenv("VIM_CLIENT_ID", "").strip()
-            and os.getenv("VIM_CLIENT_SECRET", "").strip()
-        ),
     }
 
 
