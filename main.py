@@ -90,12 +90,41 @@ def _rate_ok() -> bool:
 
 
 # ---- Health -----------------------------------------------------------------
+# Health that tells the truth (2026-10-28): "claude" used to mean only that a key was SET. On 2026-10-28 the key on
+# fbk1 was set and refused (AuthenticationError on every note), while health said claude: true. Now
+# "claude_ok" is a real check: a 1-token call to Claude, cached for 10 minutes so health stays cheap.
+# No chart data is ever sent in the check.
+_CLAUDE_CHECK: Dict[str, Any] = {"at": 0.0, "ok": None, "why": ""}
+
+
+def _claude_ok() -> Dict[str, Any]:
+    key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not key:
+        return {"ok": False, "why": "no key"}
+    if _CLAUDE_CHECK["ok"] is not None and time.time() - _CLAUDE_CHECK["at"] < 600:
+        return {"ok": _CLAUDE_CHECK["ok"], "why": _CLAUDE_CHECK["why"]}
+    ok, why = False, ""
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=key)
+        client.messages.create(model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5"), max_tokens=1,
+                               messages=[{"role": "user", "content": "ping"}])
+        ok = True
+    except Exception as e:  # never the key, never a stack trace
+        why = type(e).__name__
+    _CLAUDE_CHECK.update({"at": time.time(), "ok": ok, "why": why})
+    return {"ok": ok, "why": why}
+
+
 @app.get("/api/health")
 async def health():
+    chk = _claude_ok()
     return {
         "status": "ok",
         "version": APP_VERSION,
         "claude": bool(os.getenv("ANTHROPIC_API_KEY", "").strip()),
+        "claude_ok": chk["ok"],
+        "claude_why": chk["why"],
         "model": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5"),
         "local_rules": True,
         "chart_in": True,
