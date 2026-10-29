@@ -68,11 +68,13 @@ Hard rules:
 2. The HPI is one chronological story in plain clinical prose, third person, no headings inside it. Patient-reported symptoms are attributed as reported, never written as objective findings.
 3. Assessment and plan are by problem, numbered, and only for problems that are on the chart AND/OR were addressed in the visit. A problem on the chart that was not discussed is left out. A problem discussed but not on the chart gets a flag.
 4. Anything the provider must decide (a diagnosis not named, specificity such as CKD stage or diabetic complication, depression episode type, a controlled-substance refill) is NOT decided by you: put it in flags as a short question.
+4b. orders: every lab, imaging study, referral or in-office procedure the clinician ORDERED OR PLACED in this visit — never one only discussed, declined, done before, or planned for a later visit. name as said ("A1c", "MRI lumbar spine", "Cardiology"); problem = the problem it is for, as named in assessmentItems; to = the clinician or practice named for a referral, else ""; urgency = "urgent", the time frame as said ("within 2 weeks"), or "routine". No codes. None ordered → [].
 5. The chart's medication list is what the patient takes. Never write that a medication was stopped, held, discontinued, started or changed unless the transcript says so, and never summarise the medication list as reviewed or stopped in the plan.
 5b. Follow the provider's rules exactly when given.
 6. Output JSON only, no prose around it, with this shape:
 {"sections":{"cc":"","hpi":"","meds":"","allergies":"","pmh":"","psh":"","hosp":"","fh":"","sh":"","ros":"","exam":"","data":"","assessment":"","plan":"","next":""},
  "assessmentItems":[{"title":"","code":"","assessment":"","plan":""}],
+ "orders":[{"kind":"lab|imaging|referral|procedure","name":"","reason":"","problem":"","to":"","urgency":""}],
  "flags":[{"title":"","text":""}]}
 Keys you were not asked for stay empty strings."""
 
@@ -120,7 +122,16 @@ def _clean(d: Dict[str, Any], wanted: List[str]) -> Dict[str, Any]:
             flags.append({"title": "Check", "text": f[:300]})
         elif isinstance(f, dict):
             flags.append({"title": str(f.get("title") or "Check")[:60], "text": str(f.get("text") or "")[:300]})
-    return {"sections": sections, "assessmentItems": items, "flags": flags}
+    orders = []
+    for o in (d.get("orders") or [])[:15]:
+        if not isinstance(o, dict):
+            continue
+        kind = str(o.get("kind") or "").lower().strip()
+        name = str(o.get("name") or "").strip()[:120]
+        if kind in ("lab", "imaging", "referral", "procedure") and name:
+            orders.append({"kind": kind, "name": name, "reason": str(o.get("reason") or "")[:200], "problem": str(o.get("problem") or "")[:200],
+                           "to": str(o.get("to") or "")[:120], "urgency": str(o.get("urgency") or "")[:40]})
+    return {"sections": sections, "assessmentItems": items, "flags": flags, "orders": orders}
 
 
 @router.post("/api/note")
