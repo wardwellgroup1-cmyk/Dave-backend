@@ -22,6 +22,8 @@ Rules the route enforces regardless of what the model returns:
   - nothing is invented: the model is told to use only the transcript and chart; empty sections stay empty
   - questions for the provider come back as flags ("CHECK BEFORE SIGNING"), never settled by the model
   - no PHI is logged; errors return JSON, never a stack trace
+  - server-side checks add flags for: pronoun vs chart sex, med frequency vs chart, refill on a controlled/high-risk med (PDMP),
+    acute chart diagnosis not discussed today, G89 pain code next to an explaining diagnosis; stray "." lines are removed
 """
 from __future__ import annotations
 
@@ -71,6 +73,13 @@ Hard rules:
 4b. orders: every lab, imaging study, referral or in-office procedure the clinician ORDERED OR PLACED in this visit — never one only discussed, declined, done before, or planned for a later visit. name as said ("A1c", "MRI lumbar spine", "Cardiology"); problem = the problem it is for, as named in assessmentItems; to = the clinician or practice named for a referral, else ""; urgency = "urgent", the time frame as said ("within 2 weeks"), or "routine". No codes. None ordered → [].
 5. The chart's medication list is what the patient takes. Never write that a medication was stopped, held, discontinued, started or changed unless the transcript says so, and never summarise the medication list as reviewed or stopped in the plan.
 5b. Follow the provider's rules exactly when given.
+7. Pronouns and sex come from the chart's Sex field, never from the transcript or the name.
+8. Medication dose, route and frequency come from the chart as written. If the transcript states a different frequency or dose (e.g. chart "twice a day", visit "three times daily"), write the chart's version and add a flag naming both.
+9. The plan never says something the HPI or transcript contradicts (e.g. HPI "not concerned about supply" vs plan "difficulty obtaining refills"). If the transcript is unclear, flag it instead of choosing.
+10. Turn what was said into actions: "running low", "need a refill", "almost out" on a chart medication goes in that problem's plan as "Refill requested: <med as on chart>" and, if the medication is controlled or high-risk (opioids, benzodiazepines, z-drugs, stimulants, testosterone, gabapentin, pregabalin, muscle relaxants), add a flag "PDMP check before refill". A vaccine the patient asks about or the provider plans goes in the plan with its timing as said, and in "next". A follow-up interval said in the visit goes in "next".
+11. Exam: write only the findings stated in the visit, one line per body system with the system name first ("Skin: ..."), so it merges into the template's exam line for that system.
+12. Coding questions go to flags, never settled by you: a chart diagnosis that is acute (e.g. acute respiratory failure) but was not addressed today; a primary diagnosis that is not the reason for today's visit; a pain code (G89.x) alongside a diagnosis that already explains the pain; a diagnosis whose timing or definition may not fit yet (e.g. post-herpetic neuralgia within weeks of the rash).
+13. HPI covers the HPI elements heard: location (side/dermatome), quality, severity (score if said), duration and onset date, timing, context, modifying factors, associated symptoms and pertinent negatives. Do not end any section with a stray "." line.
 6. Output JSON only, no prose around it, with this shape:
 {"sections":{"cc":"","hpi":"","meds":"","allergies":"","pmh":"","psh":"","hosp":"","fh":"","sh":"","ros":"","exam":"","data":"","assessment":"","plan":"","next":""},
  "assessmentItems":[{"title":"","code":"","assessment":"","plan":""}],
@@ -134,6 +143,90 @@ def _clean(d: Dict[str, Any], wanted: List[str]) -> Dict[str, Any]:
     return {"sections": sections, "assessmentItems": items, "flags": flags, "orders": orders}
 
 
+# ---- Server-side checks (learned from the Freed sample note review, Nov 2026) ----
+# These run on every note regardless of what the model returned, and only ever ADD flags.
+
+_FREQ = [
+    ("four times", r"\b(four times (a|per) day|four times daily|qid|4 ?x ?(a )?day)\b"),
+    ("three times", r"\b(three times (a|per) day|three times daily|tid|3 ?x ?(a )?day)\b"),
+    ("twice", r"\b(twice (a|per) day|twice daily|two times (a|per) day|bid|2 ?x ?(a )?day)\b"),
+    ("once", r"\b(once (a|per) day|once daily|daily|qd|every day)\b"),
+]
+_HIGH_RISK = ["gabapentin", "pregabalin", "tramadol", "oxycodone", "hydrocodone", "morphine", "codeine", "fentanyl",
+              "buprenorphine", "methadone", "zolpidem", "eszopiclone", "alprazolam", "lorazepam", "clonazepam", "diazepam",
+              "adderall", "amphetamine", "methylphenidate", "testosterone", "baclofen", "carisoprodol", "cyclobenzaprine", "tizanidine"]
+_REFILL = r"(refill|running low|run(ning)? out|almost out|low on|need more)"
+
+
+def _freq_of(text: str) -> str:
+    t = text.lower()
+    for name, pat in _FREQ:
+        if re.search(pat, t):
+            return name
+    return ""
+
+
+def _checks(out: Dict[str, Any], chart: Dict[str, Any], transcript: str) -> List[Dict[str, str]]:
+    flags: List[Dict[str, str]] = []
+    have = " ".join(f.get("text", "").lower() for f in out.get("flags", []))
+    sec = out.get("sections", {})
+    note = " ".join([sec.get(k, "") for k in ("hpi", "plan", "assessment", "meds")] +
+                    [i.get("plan", "") + " " + i.get("assessment", "") for i in out.get("assessmentItems", [])])
+    nl = note.lower()
+
+    def add(title: str, text: str) -> None:
+        if text.lower()[:40] not in have:
+            flags.append({"title": title, "text": text[:300]})
+
+    # 1. pronoun vs chart sex
+    sex = str(chart.get("sex") or "").strip().lower()[:1]
+    he = len(re.findall(r"\b(he|his|him)\b", nl))
+    she = len(re.findall(r"\b(she|her|hers)\b", nl))
+    if sex == "f" and he > she:
+        add("Pronoun", "Chart sex is female but the note uses he/his. Check pronouns before signing.")
+    elif sex == "m" and she > he:
+        add("Pronoun", "Chart sex is male but the note uses she/her. Check pronouns before signing.")
+
+    meds = chart.get("meds") or []
+    if isinstance(meds, str):
+        meds = [m for m in re.split(r"[;\n]", meds) if m.strip()]
+    tl = (transcript or "").lower()
+    refill_talk = bool(re.search(_REFILL, tl))
+    for m in meds[:60]:
+        ms = str(m)
+        name = (re.match(r"\s*([A-Za-z][A-Za-z\-]+)", ms) or [None, ""])[1].lower()
+        if len(name) < 4:
+            continue
+        # 2. frequency in the note vs the chart's medication list
+        chart_f = _freq_of(ms)
+        for hit in re.finditer(re.escape(name), nl):
+            note_f = _freq_of(nl[hit.start(): hit.start() + 80])
+            if chart_f and note_f and note_f != chart_f:
+                add("Medication", f"{name.title()}: chart says {chart_f} a day, note says {note_f} a day. Confirm dose and frequency before signing.")
+                break
+        # 3. refill heard on a controlled / high-risk med -> PDMP before refill
+        if refill_talk and name in tl and any(h in name for h in _HIGH_RISK):
+            add("PDMP", f"Refill talk heard for {name.title()} (controlled/high-risk). Run the PDMP check; Dave does not stage this refill.")
+
+    # 4. acute chart diagnosis carried into today's assessment without being discussed
+    for it in out.get("assessmentItems", []):
+        code = (it.get("code") or "").upper()
+        title = (it.get("title") or "").lower()
+        if (code.startswith(("J96.0", "I21", "N17", "J96.2")) or "acute respiratory failure" in title) and not any(w in tl for w in re.findall(r"[a-z]{6,}", title) if w not in ("acute", "chronic", "unspecified", "without")):
+            add("Coding", f"{it.get('title') or code} is an acute diagnosis not discussed today. Remove or confirm before billing.")
+
+    # 5. pain code next to a diagnosis that explains the pain
+    codes = [(i.get("code") or "").upper() for i in out.get("assessmentItems", [])]
+    if any(c.startswith("G89") for c in codes) and any(c.startswith(("B02", "M", "G50", "G54", "G56", "G57")) for c in codes):
+        add("Coding", "A G89 pain code is listed with a diagnosis that already explains the pain. Provider to confirm the G89 code is needed.")
+
+    # 6. strip stray "." lines the model may leave
+    for k, v in sec.items():
+        if v:
+            sec[k] = re.sub(r"(?m)^\s*\.\s*$\n?", "", v).rstrip()
+    return flags
+
+
 @router.post("/api/note")
 async def api_note(body: NoteIn):
     if anthropic is None or not os.getenv("ANTHROPIC_API_KEY"):
@@ -168,5 +261,7 @@ async def api_note(body: NoteIn):
         return JSONResponse({"error": "model returned no JSON"}, status_code=502)
 
     out = _clean(parsed, wanted)
+    out["flags"].extend(_checks(out, body.chart or {}, body.transcript))
+    out["flags"] = out["flags"][:25]
     out.update({"template_id": body.template_id, "model": MODEL, "engine": "render-note"})
     return out
