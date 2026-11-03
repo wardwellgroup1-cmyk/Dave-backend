@@ -81,7 +81,7 @@ Hard rules:
 12. Coding questions go to flags, never settled by you: a chart diagnosis that is acute (e.g. acute respiratory failure) but was not addressed today; a primary diagnosis that is not the reason for today's visit; a pain code (G89.x) alongside a diagnosis that already explains the pain; a diagnosis whose timing or definition may not fit yet (e.g. post-herpetic neuralgia within weeks of the rash).
 13. HPI covers the HPI elements heard: location (side/dermatome), quality, severity (score if said), duration and onset date, timing, context, modifying factors, associated symptoms and pertinent negatives. Do not end any section with a stray "." line.
 14. Treatment by diagnosis (the plan): each plan item goes under its MATCHING diagnosis, matched by ICD-10 code first, then by name. Each diagnosis gets one or two plain sentences: no "Assessment:", "Medications:" or "Plan:" labels inside an item. Skip a diagnosis when the provider's clinical notes already cover it. Never restate an order already shown as a structured prescription, lab or referral line. Drop filler such as "Ongoing symptom.". Use only facts from the visit or the chart. Never write a reference range (for example "normal range") as a result. A plan item with no matching diagnosis goes in flags for the provider to review; never put it under an "N/A Other" heading and never add a diagnosis on your own.
-15. GROUNDING: write only what the provider said in the transcript or what is on the chart. Never write a refill, a counseling line, an order, a medication change, a dose, a number, a diagnosis or a plan item that was not said. If a section would need one that was not said, leave it out and add a flag instead.
+15. GROUNDING: write only what the provider said in the transcript or what is on the chart. Anything else you would suggest (a refill, counseling, an order, a follow-up) goes in the \"suggestions\" list, never in a section.
 16. ONE ENTRY PER PROBLEM: each problem appears once, under its own heading, in Assessment and Plan. Never repeat the same assessment, medication or counseling line under a second heading.
 17. DOSE CONFLICTS: when the visit states a dose or number that differs from the chart, write the chart's version and add a flag naming both. Never write the visit's number as the new dose unless the provider said it was changed.
 6. Output JSON only, no prose around it, with this shape:
@@ -243,6 +243,44 @@ def _checks(out: Dict[str, Any], chart: Dict[str, Any], transcript: str) -> List
             sec[k] = re.sub(r"(?m)^\s*\.\s*$\n?", "", v).rstrip()
     return flags
 
+_STOP = set("about after again along also been before being between could during every first given their there these those where which while would should there patient provider visit today might plan other still through".split())
+
+
+def _grounded(line: str, source: str) -> bool:
+    words = [w for w in re.findall(r"[a-z]{5,}", line.lower()) if w not in _STOP]
+    if not words:
+        return True
+    hit = sum(1 for w in words if w in source)
+    return hit / len(words) >= 0.5
+
+
+def _ground_sections(sec: Dict[str, str], items: List[Dict[str, Any]], transcript: str, chart: Dict[str, Any]) -> List[str]:
+    """Hard rule (push-fix 2026-11-03): a line in plan, assessment or meds that the visit and chart do not support leaves the
+    note and becomes a SUGGESTION for the provider. Nothing ungrounded is written into a section."""
+    source = ((transcript or "") + " " + json.dumps(chart or {}, default=str)).lower()
+    out: List[str] = []
+    for k in ("plan", "assessment", "meds"):
+        keep: List[str] = []
+        for ln in (sec.get(k, "") or "").splitlines():
+            t = ln.strip()
+            if not t or _grounded(t, source):
+                keep.append(ln)
+            else:
+                out.append(t)
+        sec[k] = "\n".join(keep).strip()
+    for it in items:
+        for f in ("assessment", "plan"):
+            kept = []
+            for ln in (it.get(f, "") or "").splitlines():
+                t = ln.strip()
+                if not t or _grounded(t, source):
+                    kept.append(ln)
+                else:
+                    out.append(t)
+            it[f] = "\n".join(kept).strip()
+    seen = set()
+    return [x for x in out if not (x in seen or seen.add(x))][:20]
+
 
 @router.post("/api/note")
 async def api_note(body: NoteIn):
@@ -278,6 +316,7 @@ async def api_note(body: NoteIn):
         return JSONResponse({"error": "model returned no JSON"}, status_code=502)
 
     out = _clean(parsed, wanted)
+    out["suggestions"] = _ground_sections(out["sections"], out["assessmentItems"], body.transcript, body.chart or {})
     out["flags"].extend(_checks(out, body.chart or {}, body.transcript))
     out["flags"] = out["flags"][:25]
     out.update({"template_id": body.template_id, "model": MODEL, "engine": "render-note"})
