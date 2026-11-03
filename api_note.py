@@ -80,6 +80,7 @@ Hard rules:
 11. Exam: write only the findings stated in the visit, one line per body system with the system name first ("Skin: ..."), so it merges into the template's exam line for that system.
 12. Coding questions go to flags, never settled by you: a chart diagnosis that is acute (e.g. acute respiratory failure) but was not addressed today; a primary diagnosis that is not the reason for today's visit; a pain code (G89.x) alongside a diagnosis that already explains the pain; a diagnosis whose timing or definition may not fit yet (e.g. post-herpetic neuralgia within weeks of the rash).
 13. HPI covers the HPI elements heard: location (side/dermatome), quality, severity (score if said), duration and onset date, timing, context, modifying factors, associated symptoms and pertinent negatives. Do not end any section with a stray "." line.
+14. Treatment by diagnosis (the plan): each plan item goes under its MATCHING diagnosis, matched by ICD-10 code first, then by name. Each diagnosis gets one or two plain sentences: no "Assessment:", "Medications:" or "Plan:" labels inside an item. Skip a diagnosis when the provider's clinical notes already cover it. Never restate an order already shown as a structured prescription, lab or referral line. Drop filler such as "Ongoing symptom.". Use only facts from the visit or the chart. Never write a reference range (for example "normal range") as a result. A plan item with no matching diagnosis goes in flags for the provider to review; never put it under an "N/A Other" heading and never add a diagnosis on your own.
 6. Output JSON only, no prose around it, with this shape:
 {"sections":{"cc":"","hpi":"","meds":"","allergies":"","pmh":"","psh":"","hosp":"","fh":"","sh":"","ros":"","exam":"","data":"","assessment":"","plan":"","next":""},
  "assessmentItems":[{"title":"","code":"","assessment":"","plan":""}],
@@ -220,6 +221,12 @@ def _checks(out: Dict[str, Any], chart: Dict[str, Any], transcript: str) -> List
     if any(c.startswith("G89") for c in codes) and any(c.startswith(("B02", "M", "G50", "G54", "G56", "G57")) for c in codes):
         add("Coding", "A G89 pain code is listed with a diagnosis that already explains the pain. Provider to confirm the G89 code is needed.")
 
+    # 7. reference ranges are never results, and filler lines are dropped (push spec, Treatment rule)
+    for k in ("plan", "assessment"):
+        v = sec.get(k, "")
+        if v:
+            kept = [ln for ln in v.splitlines() if not re.search(r"normal range|reference range|ongoing symptom\.?\s*$", ln, re.I)]
+            sec[k] = "\n".join(kept).rstrip()
     # 6. strip stray "." lines the model may leave
     for k, v in sec.items():
         if v:
@@ -249,7 +256,7 @@ async def api_note(body: NoteIn):
     try:
         client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", "").strip())
         msg = client.messages.create(
-            model=MODEL, max_tokens=MAX_TOKENS, system=SYSTEM,
+            model=MODEL, max_tokens=MAX_TOKENS, temperature=0, system=SYSTEM,
             messages=[{"role": "user", "content": user}],
         )
         text = "".join(getattr(p, "text", "") for p in msg.content)
