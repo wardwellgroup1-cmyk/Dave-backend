@@ -81,6 +81,9 @@ Hard rules:
 12. Coding questions go to flags, never settled by you: a chart diagnosis that is acute (e.g. acute respiratory failure) but was not addressed today; a primary diagnosis that is not the reason for today's visit; a pain code (G89.x) alongside a diagnosis that already explains the pain; a diagnosis whose timing or definition may not fit yet (e.g. post-herpetic neuralgia within weeks of the rash).
 13. HPI covers the HPI elements heard: location (side/dermatome), quality, severity (score if said), duration and onset date, timing, context, modifying factors, associated symptoms and pertinent negatives. Do not end any section with a stray "." line.
 14. Treatment by diagnosis (the plan): each plan item goes under its MATCHING diagnosis, matched by ICD-10 code first, then by name. Each diagnosis gets one or two plain sentences: no "Assessment:", "Medications:" or "Plan:" labels inside an item. Skip a diagnosis when the provider's clinical notes already cover it. Never restate an order already shown as a structured prescription, lab or referral line. Drop filler such as "Ongoing symptom.". Use only facts from the visit or the chart. Never write a reference range (for example "normal range") as a result. A plan item with no matching diagnosis goes in flags for the provider to review; never put it under an "N/A Other" heading and never add a diagnosis on your own.
+15. GROUNDING: write only what the provider said in the transcript or what is on the chart. Never write a refill, a counseling line, an order, a medication change, a dose, a number, a diagnosis or a plan item that was not said. If a section would need one that was not said, leave it out and add a flag instead.
+16. ONE ENTRY PER PROBLEM: each problem appears once, under its own heading, in Assessment and Plan. Never repeat the same assessment, medication or counseling line under a second heading.
+17. DOSE CONFLICTS: when the visit states a dose or number that differs from the chart, write the chart's version and add a flag naming both. Never write the visit's number as the new dose unless the provider said it was changed.
 6. Output JSON only, no prose around it, with this shape:
 {"sections":{"cc":"","hpi":"","meds":"","allergies":"","pmh":"","psh":"","hosp":"","fh":"","sh":"","ros":"","exam":"","data":"","assessment":"","plan":"","next":""},
  "assessmentItems":[{"title":"","code":"","assessment":"","plan":""}],
@@ -227,6 +230,13 @@ def _checks(out: Dict[str, Any], chart: Dict[str, Any], transcript: str) -> List
         if v:
             kept = [ln for ln in v.splitlines() if not re.search(r"normal range|reference range|ongoing symptom\.?\s*$", ln, re.I)]
             sec[k] = "\n".join(kept).rstrip()
+    # 8. a number with a unit in the note must be in the visit or on the chart (grounding, push-fix 2026-11-03)
+    source = ((transcript or "") + " " + json.dumps(chart or {}, default=str)).lower()
+    src_nums = set(re.findall(r"\d+(?:\.\d+)?", source))
+    for k in ("plan", "assessment", "meds", "hpi"):
+        for n_, unit in set(re.findall(r"(\d+(?:\.\d+)?)\s*(units?|mg|mcg|ml|%)", sec.get(k, "") or "", re.I)):
+            if n_ not in src_nums:
+                add("Check number", f"The note has {n_} {unit} that is not in the visit or on the chart. Confirm before signing.")
     # 6. strip stray "." lines the model may leave
     for k, v in sec.items():
         if v:
