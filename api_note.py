@@ -158,7 +158,7 @@ _FREQ = [
 ]
 _HIGH_RISK = ["gabapentin", "pregabalin", "tramadol", "oxycodone", "hydrocodone", "morphine", "codeine", "fentanyl",
               "buprenorphine", "methadone", "zolpidem", "eszopiclone", "alprazolam", "lorazepam", "clonazepam", "diazepam",
-              "adderall", "amphetamine", "methylphenidate", "testosterone", "baclofen", "carisoprodol", "cyclobenzaprine", "tizanidine"]
+              "adderall", "amphetamine", "methylphenidate", "testosterone", "baclofen", "carisoprodol", "cyclobenzaprine", "tizanidine", "phentermine", "modafinil", "armodafinil", "lisdexamfetamine", "dextroamphetamine", "hydromorphone", "tapentadol", "butalbital", "phenobarbital", "temazepam", "triazolam", "clobazam", "zaleplon", "pentazocine"]
 _REFILL = r"(refill|running low|run(ning)? out|almost out|low on|need more)"
 
 
@@ -195,7 +195,6 @@ def _checks(out: Dict[str, Any], chart: Dict[str, Any], transcript: str) -> List
     if isinstance(meds, str):
         meds = [m for m in re.split(r"[;\n]", meds) if m.strip()]
     tl = (transcript or "").lower()
-    refill_talk = bool(re.search(_REFILL, tl))
     for m in meds[:60]:
         ms = str(m)
         name = (re.match(r"\s*([A-Za-z][A-Za-z\-]+)", ms) or [None, ""])[1].lower()
@@ -208,9 +207,16 @@ def _checks(out: Dict[str, Any], chart: Dict[str, Any], transcript: str) -> List
             if chart_f and note_f and note_f != chart_f:
                 add("Medication", f"{name.title()}: chart says {chart_f} a day, note says {note_f} a day. Confirm dose and frequency before signing.")
                 break
-        # 3. refill heard on a controlled / high-risk med -> PDMP before refill
-        if refill_talk and name in tl and any(h in name for h in _HIGH_RISK):
+        # 3. refill talk near THIS medication's name on a controlled / high-risk med -> PDMP before refill
+        if any(h in name for h in _HIGH_RISK) and _near(name, tl, _REFILL):
             add("PDMP", f"Refill talk heard for {name.title()} (controlled/high-risk). Run the PDMP check; Dave does not stage this refill.")
+
+    # 3b. HPI completeness: long visit, but the HPI is missing a core element -> ask, never invent
+    hpi_text = sec.get("hpi", "") or ""
+    if len(hpi_text) > 40 and len(tl) > 400:
+        for label, pat in _HPI_ELEMENTS:
+            if not re.search(pat, hpi_text, re.I):
+                add("HPI", f"HPI has no {label}. If it was not asked, say so; if it was said, add it before signing.")
 
     # 4. acute chart diagnosis carried into today's assessment without being discussed
     for it in out.get("assessmentItems", []):
@@ -254,26 +260,105 @@ def _grounded(line: str, source: str) -> bool:
     return hit / len(words) >= 0.5
 
 
+# ---- Medication safety (fix 2026-11-03) ----
+# A line that starts, stops, increases, decreases or switches a medication reaches the note only when it names a
+# medication already on the chart AND the transcript says the provider did it, in an affirmative sentence near the
+# drug name. Questions and discussed-but-not-done changes never qualify; those lines become suggestions.
+_MED_ACTION = re.compile(
+    r"\b(start\w*|begin\w*|prescrib\w*|new (?:med|medication|rx|prescription)|increas\w*|decreas\w*|switch\w*|"
+    r"titrat\w*|discontinu\w*|stop\w*|hold\w*|restart\w*)\b",
+    re.I,
+)
+_MED_SAID = re.compile(
+    r"(?:i'?ll|i will|we'?ll|we will|let'?s|i'?m going to|i am going to|i'?m gonna|we'?re going to|"
+    r"i'?m|we'?re|i'?ve|we'?ve)\s+(?:now\s+)?"
+    r"(?:start|begin|prescribe|increase|decrease|switch|stop|hold|restart|discontinue|titrate)"
+    r"|(?:started|prescribed|increased|decreased|switched|stopped|discontinued|restarted|titrated)"
+    r"\s+(?:you |him |her |them |the patient )?(?:on|to|off)"
+    r"|(?:rx|prescription) (?:sent|given|written|called in)"
+    r"|(?:start|starting|begin|beginning|prescribe|increase|decrease|switch|stop|hold|restart)"
+    r"\s+(?:you|him|her|them|the patient)\s+(?:on|to|off)",
+    re.I,
+)
+
+
+def _chart_med_names(meds: Any) -> set:
+    if isinstance(meds, str):
+        meds = [m for m in re.split(r"[;\n]", meds) if m.strip()]
+    names = set()
+    for m in meds or []:
+        mm = re.match(r"\s*([A-Za-z][A-Za-z\-]+)", str(m))
+        if mm and len(mm.group(1)) >= 4:
+            names.add(mm.group(1).lower())
+    return names
+
+
+def _med_said_affirmatively(name: str, transcript: str) -> bool:
+    tl = (transcript or "").lower()
+    for m in re.finditer(re.escape(name), tl):
+        win = tl[max(0, m.start() - 140): m.end() + 140]
+        if "?" in win:
+            continue
+        if _MED_SAID.search(win):
+            return True
+    return False
+
+
+def _med_line_ok(line: str, med_names: set, transcript: str) -> bool:
+    if not _MED_ACTION.search(line):
+        return True
+    mentioned = [n for n in med_names if n in line.lower()]
+    if not mentioned:
+        return False
+    return any(_med_said_affirmatively(n, transcript) for n in mentioned)
+
+
+def _near(name: str, text: str, pattern: str) -> bool:
+    """True when the drug's own sentence, or the sentence right after it (for "it"), carries the pattern."""
+    sents = [x for x in re.split(r"(?<=[.?!])\s+|\n+", text) if x.strip()]
+    for i, sent in enumerate(sents):
+        if name in sent.lower():
+            for j in (i, i + 1):
+                if j < len(sents) and re.search(pattern, sents[j], re.I):
+                    return True
+    return False
+
+
+_HPI_ELEMENTS = [
+    ("duration or onset", r"\b(since|for (the )?(past|last)|\d+\s*(hour|day|week|month|year)s?|"
+                          r"(one|two|three|four|five|six|several|a few|couple of)\s+(hour|day|week|month|year)s?|"
+                          r"started|onset|began)\b"),
+    ("severity", r"\b(\d{1,2}\s*/\s*10|mild|moderate|severe|scale)\b"),
+    ("timing", r"\b(morning|evening|night|constant|intermittent|episodic|daily|at rest|comes and goes|all day|occasional)\b"),
+    ("what makes it better or worse", r"\b(better|worse|worsen\w*|helps?|relie\w*|improv\w*|aggravat\w*|triggers?)\b"),
+]
+
+
 def _ground_sections(sec: Dict[str, str], items: List[Dict[str, Any]], transcript: str, chart: Dict[str, Any]) -> List[str]:
-    """Hard rule (push-fix 2026-11-03): a line in plan, assessment or meds that the visit and chart do not support leaves the
-    note and becomes a SUGGESTION for the provider. Nothing ungrounded is written into a section."""
+    """Hard rule: a line in plan, assessment or meds that the visit and chart do not support, or that starts/changes a
+    medication the provider did not affirmatively say, leaves the note and becomes a SUGGESTION for the provider."""
     source = ((transcript or "") + " " + json.dumps(chart or {}, default=str)).lower()
+    med_names = _chart_med_names((chart or {}).get("meds") or [])
+
+    def keep(t: str) -> bool:
+        return _grounded(t, source) and _med_line_ok(t, med_names, transcript or "")
+
     out: List[str] = []
     for k in ("plan", "assessment", "meds"):
-        keep: List[str] = []
+        kept: List[str] = []
         for ln in (sec.get(k, "") or "").splitlines():
             t = ln.strip()
-            if not t or _grounded(t, source):
-                keep.append(ln)
+            if not t or keep(t):
+                kept.append(ln)
             else:
                 out.append(t)
-        sec[k] = "\n".join(keep).strip()
+        sec[k] = "\n".join(kept).strip()
     for it in items:
         for f in ("assessment", "plan"):
             kept = []
             for ln in (it.get(f, "") or "").splitlines():
                 t = ln.strip()
-                if not t or _grounded(t, source):
+                if not t or keep(t):
                     kept.append(ln)
                 else:
                     out.append(t)
