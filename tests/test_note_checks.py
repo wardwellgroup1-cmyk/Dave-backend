@@ -125,3 +125,32 @@ def test_fever_with_normal_temp_asks_provider():
 def test_fever_with_fever_temp_not_flagged():
     _, flags = _checks_on({"ros": "General: Positive for fevers at night x2 days.", "data": "Temp: 101.2 F"})
     assert not any(f["title"] == "Fever" for f in flags)
+
+
+# ---- Professional HPI checks (from the 11/3 follow-up sample) ----
+def test_patient_name_in_hpi_is_flagged():
+    _, flags = _checks_on({"hpi": "Johana Smith is a 73 year old female presenting for a dose increase."},
+                          chart={"sex": "F", "meds": [], "name": "Johana Smith"})
+    assert any(f["title"] == "HPI style" and "name" in f["text"] for f in flags)
+
+
+def test_cost_and_pharmacy_in_hpi_is_flagged():
+    _, flags = _checks_on({"hpi": "She is receiving the drug at a cost of $50 per prescription, picked up at CVS."})
+    assert any(f["title"] == "HPI style" and "Cost" in f["text"] for f in flags)
+
+
+def test_side_effects_in_medication_list_are_flagged():
+    _, flags = _checks_on({"meds": "Zepbound 12.5 mg subcutaneous injection\nNo side effects reported, approximately 20 pounds weight loss"})
+    assert any(f["title"] == "Medications" and "Side effects" in f["text"] for f in flags)
+
+
+def test_generic_drug_class_in_medication_list_is_flagged():
+    _, flags = _checks_on({"meds": "Diuretic for blood pressure management, recently changed"})
+    assert any(f["title"] == "Medications" and "class only" in f["text"] for f in flags)
+
+
+def test_clean_hpi_and_named_medication_are_not_flagged():
+    _, flags = _checks_on({"hpi": "She has been on Zepbound 12.5 mg for at least four months and reports no side effects.",
+                           "meds": "Zepbound 12.5 mg subcutaneous injection via KwikPen"},
+                          chart={"sex": "F", "meds": [], "name": "Johana Smith"})
+    assert not any(f["title"] in ("HPI style", "Medications") for f in flags)

@@ -263,6 +263,23 @@ def _checks(out: Dict[str, Any], chart: Dict[str, Any], transcript: str) -> List
         if t < 99.5:
             add("Fever", f"Fever is reported, but the recorded temperature is {temp_m.group(1)} F. Ask the patient about fever today before signing.")
 
+    # 3i. HPI body style: no patient name, no cost/pharmacy/program details (administrative, not history)
+    hpi_body = sec.get("hpi", "") or ""
+    chart_name = str(chart.get("name") or "").strip()
+    if hpi_body and ((chart_name and chart_name.lower() in hpi_body.lower())
+                     or re.match(r"\s*[A-Z][a-z]+ [A-Z][a-z]+\s+(a|an|is|presents|has|reports)\b", hpi_body)):
+        add("HPI style", "The patient's name appears in the HPI body. Use 'she', 'he' or 'the patient'; identity is already in the header.")
+    if hpi_body and re.search(r"\$\s?\d|\bcopay\b|\bper prescription\b|\bpicked up\b|\bpharmacy\b|\bprogram\b|\bCVS\b|\bWalgreens\b|\bRite Aid\b|\bMedicare\b|\bMedicaid\b", hpi_body, re.I):
+        add("HPI style", "Cost, pharmacy or program details are in the HPI. Move them out; they are administrative, not history.")
+
+    # 3j. medication entries: drug, dose, route, device only; side effects and weight trends belong in the HPI
+    if meds_sec and re.search(r"side effects?|constipation|weight (loss|gain)|pounds|\blost\b|\bgained\b|nausea", meds_sec, re.I):
+        add("Medications", "Side effects or weight changes are in the medication list. Keep them in the HPI; the medication entry is drug, dose, route and device.")
+
+    # 3k. generic drug class instead of a named drug in the medication list
+    if meds_sec and re.search(r"\b(diuretic|water pill|blood pressure medication|antibiotic|blood thinner)\b", meds_sec, re.I):
+        add("Medications", "A medication is described by class only (for example 'diuretic'). Name the drug as on the chart.")
+
     # 4. acute chart diagnosis carried into today's assessment without being discussed
     for it in out.get("assessmentItems", []):
         code = (it.get("code") or "").upper()
