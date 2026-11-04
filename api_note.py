@@ -218,6 +218,51 @@ def _checks(out: Dict[str, Any], chart: Dict[str, Any], transcript: str) -> List
             if not re.search(pat, hpi_text, re.I):
                 add("HPI", f"HPI has no {label}. If it was not asked, say so; if it was said, add it before signing.")
 
+    # 3c. medication list says nothing is taken while listing drugs (contradiction, rule 9)
+    meds_sec = sec.get("meds", "") or ""
+    if meds_sec and re.search(r"\b(none currently|not taking any|no (current )?medications|none on any|not on any)\b", meds_sec, re.I) \
+            and re.search(r"\b(mg|tablet|pack|syrup|every|daily|times a day|as needed|needed)\b", meds_sec, re.I):
+        add("Medications", "The medication list both names drugs and says none are taken. Confirm the current list before signing.")
+
+    # 3d. HPI should mention active medications that relate to this visit
+    for name in sorted(_chart_med_names(meds)) + sorted(set(re.findall(r"\b(azithromycin|amoxicillin|promethazine|prednisone|fluconazole|doxycycline|cephalexin|ibuprofen|acetaminophen)\b", tl))):
+        if name in tl and name not in (sec.get("hpi", "") or "").lower() and len(sec.get("hpi", "") or "") > 40:
+            add("HPI", f"{name.title()} is in the visit but not in the HPI. Mention it if it is part of this illness.")
+            break
+
+    # 3e. allergies must be NKDA, a named allergen, or a clear statement; garbled text is flagged
+    allergy_sec = sec.get("allergies", "") or ""
+    if allergy_sec and not re.search(r"\b(nkda|n\.?k\.?d\.?a|no known|allerg\w*|penicillin|sulfa|latex|peanut|shellfish|codeine|iodine|nuts?)\b", allergy_sec, re.I):
+        add("Allergies", "The allergy section does not say NKDA or name an allergen. Confirm with the patient before signing.")
+
+    # 3f. vitals and percentiles belong in the vitals/data section, not Social History
+    sh_text = sec.get("sh", "") or ""
+    if sh_text:
+        vital_pat = re.compile(r"\b(BP|HR|Temp|Oxygen sat|SpO2|BMI|Wt|Ht|heart rate|blood pressure|weight)\b|\d{2,3}\s*/\s*\d{2,3}\s*mm|\d+(\.\d+)?\s*(lb|lbs|kg)\b|%", re.I)
+        parts = re.split(r"(?<=\.)\s+|\s+(?=Past Results\b)|\n+", sh_text)
+        moved = [p.strip() for p in parts if p.strip() and vital_pat.search(p)]
+        if moved:
+            keep_sh = [p.strip() for p in parts if p.strip() and not vital_pat.search(p)]
+            sec["sh"] = " ".join(keep_sh)
+            sec["data"] = "\n".join([x for x in [sec.get("data", "") or "", *moved] if x])
+            add("Vitals", "Vitals were in Social History and were moved to the data section. Check the values, and the height (a number like 69 with no unit is inches, not age).")
+
+    # 3g. each ROS symptom appears once, under one system
+    ros_lines = [l for l in (sec.get("ros", "") or "").splitlines() if l.strip()]
+    for sym in ("sore throat", "fever", "fevers", "fatigue", "diarrhea", "congestion", "body aches", "loss of appetite"):
+        hits = [l for l in ros_lines if sym in l.lower()]
+        if len(hits) > 1:
+            add("ROS", f"'{sym}' appears under more than one ROS system. Keep it under one system.")
+            break
+
+    # 3h. fever reported but the recorded temperature is normal: a question for the provider, never settled by us
+    temp_m = re.search(r"\btemp\w*\s*[:]?\s*(\d{2,3}(?:\.\d)?)", (sec.get("data", "") or "") + " " + (sh_text or ""), re.I)
+    fever_talk = re.search(r"\bfevers?\b", " ".join(ros_lines) + " " + (sec.get("hpi", "") or ""), re.I)
+    if temp_m and fever_talk:
+        t = float(temp_m.group(1))
+        if t < 99.5:
+            add("Fever", f"Fever is reported, but the recorded temperature is {temp_m.group(1)} F. Ask the patient about fever today before signing.")
+
     # 4. acute chart diagnosis carried into today's assessment without being discussed
     for it in out.get("assessmentItems", []):
         code = (it.get("code") or "").upper()
